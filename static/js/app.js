@@ -17,6 +17,22 @@ let accountKeywordCache = {};
 let cacheTimestamp = 0;
 const CACHE_DURATION = 30000; // 30秒缓存
 
+// 商品列表搜索和分页相关变量
+let allItemsData = []; // 存储所有商品数据
+let filteredItemsData = []; // 存储过滤后的商品数据
+let currentItemsPage = 1; // 当前页码
+let itemsPerPage = 20; // 每页显示数量
+let totalItemsPages = 0; // 总页数
+let currentSearchKeyword = ''; // 当前搜索关键词
+
+// 订单列表搜索和分页相关变量
+let allOrdersData = []; // 存储所有订单数据
+let filteredOrdersData = []; // 存储过滤后的订单数据
+let currentOrdersPage = 1; // 当前页码
+let ordersPerPage = 20; // 每页显示数量
+let totalOrdersPages = 0; // 总页数
+let currentOrderSearchKeyword = ''; // 当前搜索关键词
+
 // ================================
 // 通用功能 - 菜单切换和导航
 // ================================
@@ -61,6 +77,9 @@ function showSection(sectionName) {
     case 'items':           // 【商品管理菜单】
         loadItems();
         break;
+    case 'orders':          // 【订单管理菜单】
+        loadOrders();
+        break;
     case 'auto-reply':      // 【自动回复菜单】
         refreshAccountList();
         break;
@@ -75,6 +94,9 @@ function showSection(sectionName) {
         break;
     case 'message-notifications':  // 【消息通知菜单】
         loadMessageNotifications();
+        break;
+    case 'system-settings':    // 【系统设置菜单】
+        loadSystemSettings();
         break;
     case 'logs':            // 【日志管理菜单】
         // 如果没有日志数据，则加载
@@ -180,6 +202,9 @@ async function loadDashboard() {
 
         dashboardData.totalKeywords = totalKeywords;
 
+        // 加载订单数量
+        await loadOrdersCount();
+
         // 更新仪表盘显示
         updateDashboardStats(accountsWithKeywords.length, totalKeywords, enabledAccounts);
         updateDashboardAccountsList(accountsWithKeywords);
@@ -189,6 +214,30 @@ async function loadDashboard() {
     showToast('加载仪表盘数据失败', 'danger');
     } finally {
     toggleLoading(false);
+    }
+}
+
+// 加载订单数量
+async function loadOrdersCount() {
+    try {
+        const token = localStorage.getItem('auth_token');
+        const response = await fetch('/admin/data/orders', {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            }
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            const ordersCount = data.data ? data.data.length : 0;
+            document.getElementById('totalOrders').textContent = ordersCount;
+        } else {
+            console.error('加载订单数量失败:', data.message);
+            document.getElementById('totalOrders').textContent = '0';
+        }
+    } catch (error) {
+        console.error('加载订单数量失败:', error);
+        document.getElementById('totalOrders').textContent = '0';
     }
 }
 
@@ -424,6 +473,42 @@ async function refreshAccountList() {
     }
 }
 
+// 只刷新关键词列表（不重新加载商品列表等其他数据）
+async function refreshKeywordsList() {
+    if (!currentCookieId) {
+        console.warn('没有选中的账号，无法刷新关键词列表');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            console.log('刷新关键词列表，从服务器获取的数据:', data);
+
+            // 更新缓存数据
+            keywordsData[currentCookieId] = data;
+
+            // 只重新渲染关键词列表
+            renderKeywordsList(data);
+
+            // 清除关键词缓存
+            clearKeywordCache();
+        } else {
+            console.error('刷新关键词列表失败:', response.status);
+            showToast('刷新关键词列表失败', 'danger');
+        }
+    } catch (error) {
+        console.error('刷新关键词列表失败:', error);
+        showToast('刷新关键词列表失败', 'danger');
+    }
+}
+
 // 加载账号关键词
 async function loadAccountKeywords() {
     const accountId = document.getElementById('accountSelect').value;
@@ -563,8 +648,8 @@ async function addKeyword() {
     const reply = document.getElementById('newReply').value.trim();
     const itemId = document.getElementById('newItemIdSelect').value.trim();
 
-    if (!keyword || !reply) {
-    showToast('请填写关键词和回复内容', 'warning');
+    if (!keyword) {
+    showToast('请填写关键词', 'warning');
     return;
     }
 
@@ -588,22 +673,32 @@ async function addKeyword() {
         currentKeywords.splice(window.editingIndex, 1);
     }
 
-    // 准备要保存的关键词列表
-    let keywordsToSave = [...currentKeywords];
+    // 准备要保存的关键词列表（只包含文本类型的关键字）
+    let textKeywords = currentKeywords.filter(item => (item.type || 'text') === 'text');
 
     // 如果是编辑模式，先移除原关键词
     if (isEditMode && typeof window.editingIndex !== 'undefined') {
-        keywordsToSave.splice(window.editingIndex, 1);
+        // 需要重新计算在文本关键字中的索引
+        const originalKeyword = keywordsData[currentCookieId][window.editingIndex];
+        const textIndex = textKeywords.findIndex(item =>
+            item.keyword === originalKeyword.keyword &&
+            (item.item_id || '') === (originalKeyword.item_id || '')
+        );
+        if (textIndex !== -1) {
+            textKeywords.splice(textIndex, 1);
+        }
     }
 
-    // 检查关键词是否已存在（考虑商品ID）
-    const existingKeyword = keywordsToSave.find(item =>
+    // 检查关键词是否已存在（考虑商品ID，检查所有类型的关键词）
+    const allKeywords = keywordsData[currentCookieId] || [];
+    const existingKeyword = allKeywords.find(item =>
         item.keyword === keyword &&
         (item.item_id || '') === (itemId || '')
     );
     if (existingKeyword) {
         const itemIdText = itemId ? `（商品ID: ${itemId}）` : '（通用关键词）';
-        showToast(`关键词 "${keyword}" ${itemIdText} 已存在，请使用其他关键词或商品ID`, 'warning');
+        const typeText = existingKeyword.type === 'image' ? '图片' : '文本';
+        showToast(`关键词 "${keyword}" ${itemIdText} 已存在（${typeText}关键词），请使用其他关键词或商品ID`, 'warning');
         toggleLoading(false);
         return;
     }
@@ -614,7 +709,7 @@ async function addKeyword() {
         reply: reply,
         item_id: itemId || ''
     };
-    keywordsToSave.push(newKeyword);
+    textKeywords.push(newKeyword);
 
     const response = await fetch(`${apiBase}/keywords-with-item-id/${currentCookieId}`, {
         method: 'POST',
@@ -623,7 +718,7 @@ async function addKeyword() {
         'Authorization': `Bearer ${authToken}`
         },
         body: JSON.stringify({
-        keywords: keywordsToSave
+        keywords: textKeywords
         })
     });
 
@@ -667,12 +762,26 @@ async function addKeyword() {
         keywordInput.focus();
         }, 100);
 
-        loadAccountKeywords(); // 重新加载关键词列表
-        clearKeywordCache(); // 清除缓存
+        // 只刷新关键词列表，不重新加载整个界面
+        await refreshKeywordsList();
     } else {
-        const errorText = await response.text();
-        console.error('关键词添加失败:', errorText);
-        showToast('关键词添加失败', 'danger');
+        try {
+            const errorData = await response.json();
+            const errorMessage = errorData.detail || '关键词添加失败';
+            console.error('关键词添加失败:', errorMessage);
+
+            // 检查是否是重复关键词的错误
+            if (errorMessage.includes('关键词已存在') || errorMessage.includes('关键词重复') || errorMessage.includes('UNIQUE constraint')) {
+                showToast(`❌ 关键词重复：${errorMessage}`, 'warning');
+            } else {
+                showToast(`❌ ${errorMessage}`, 'danger');
+            }
+        } catch (parseError) {
+            // 如果无法解析JSON，使用原始文本
+            const errorText = await response.text();
+            console.error('关键词添加失败:', errorText);
+            showToast('❌ 关键词添加失败', 'danger');
+        }
     }
     } catch (error) {
     console.error('添加关键词失败:', error);
@@ -893,9 +1002,8 @@ async function deleteKeyword(cookieId, index) {
 
     if (response.ok) {
         showToast('关键词删除成功', 'success');
-        // 重新加载关键词列表
-        loadAccountKeywords();
-        clearKeywordCache(); // 清除缓存
+        // 只刷新关键词列表，不重新加载整个界面
+        await refreshKeywordsList();
     } else {
         const errorText = await response.text();
         console.error('关键词删除失败:', errorText);
@@ -1013,7 +1121,7 @@ async function loadCookies() {
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
         <tr>
-            <td colspan="7" class="text-center py-4 text-muted empty-state">
+            <td colspan="10" class="text-center py-4 text-muted empty-state">
             <i class="bi bi-inbox fs-1 d-block mb-3"></i>
             <h5>暂无账号</h5>
             <p class="mb-0">请添加新的闲鱼账号开始使用</p>
@@ -1141,6 +1249,20 @@ async function loadCookies() {
             </div>
         </td>
         <td class="align-middle">
+            <div class="remark-cell" data-cookie-id="${cookie.id}">
+                <span class="remark-display" onclick="editRemark('${cookie.id}', '${(cookie.remark || '').replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                    ${cookie.remark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
+                </span>
+            </div>
+        </td>
+        <td class="align-middle">
+            <div class="pause-duration-cell" data-cookie-id="${cookie.id}">
+                <span class="pause-duration-display" onclick="editPauseDuration('${cookie.id}', ${cookie.pause_duration || 10})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                    <i class="bi bi-clock me-1"></i>${cookie.pause_duration || 10}分钟
+                </span>
+            </div>
+        </td>
+        <td class="align-middle">
             <div class="btn-group" role="group">
             <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-pencil"></i>
@@ -1177,6 +1299,9 @@ async function loadCookies() {
         }
         });
     });
+
+    // 重新初始化工具提示
+    initTooltips();
 
     } catch (err) {
     // 错误已在fetchJSON中处理
@@ -1583,7 +1708,7 @@ async function checkAuth() {
     }
 
     // 检查是否为管理员，显示管理员菜单和功能
-    if (result.username === 'admin') {
+    if (result.is_admin === true) {
         const adminMenuSection = document.getElementById('adminMenuSection');
         if (adminMenuSection) {
         adminMenuSection.style.display = 'block';
@@ -1593,6 +1718,12 @@ async function checkAuth() {
         const backupManagement = document.getElementById('backup-management');
         if (backupManagement) {
         backupManagement.style.display = 'block';
+        }
+
+        // 显示注册设置功能
+        const registrationSettings = document.getElementById('registration-settings');
+        if (registrationSettings) {
+        registrationSettings.style.display = 'block';
         }
     }
 
@@ -1664,10 +1795,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (value.length > 0) {
         e.target.style.borderColor = '#10b981';
-        if (replyInput.value.trim().length > 0) {
+        // 只要关键词有内容就可以添加，不需要回复内容
         addBtn.style.opacity = '1';
         addBtn.style.transform = 'scale(1)';
-        }
     } else {
         e.target.style.borderColor = '#e5e7eb';
         addBtn.style.opacity = '0.7';
@@ -1677,17 +1807,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.getElementById('newReply')?.addEventListener('input', function(e) {
     const value = e.target.value.trim();
-    const addBtn = document.querySelector('.add-btn');
     const keywordInput = document.getElementById('newKeyword');
 
+    // 回复内容可以为空，只需要关键词有内容即可
     if (value.length > 0) {
         e.target.style.borderColor = '#10b981';
-        if (keywordInput.value.trim().length > 0) {
-        addBtn.style.opacity = '1';
-        addBtn.style.transform = 'scale(1)';
-        }
     } else {
         e.target.style.borderColor = '#e5e7eb';
+    }
+
+    // 按钮状态只依赖关键词是否有内容
+    const addBtn = document.querySelector('.add-btn');
+    if (keywordInput.value.trim().length > 0) {
+        addBtn.style.opacity = '1';
+        addBtn.style.transform = 'scale(1)';
+    } else {
         addBtn.style.opacity = '0.7';
         addBtn.style.transform = 'scale(0.95)';
     }
@@ -1704,6 +1838,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 初始化编辑卡券图片文件选择器
     initEditCardImageFileSelector();
+
+    // 初始化工具提示
+    initTooltips();
+
+    // 初始化商品搜索功能
+    initItemsSearch();
 
     // 点击侧边栏外部关闭移动端菜单
     document.addEventListener('click', function(e) {
@@ -1776,7 +1916,7 @@ function renderDefaultRepliesList(accounts, defaultReplies) {
     if (accounts.length === 0) {
     tbody.innerHTML = `
         <tr>
-        <td colspan="4" class="text-center py-4 text-muted">
+        <td colspan="5" class="text-center py-4 text-muted">
             <i class="bi bi-chat-text fs-1 d-block mb-3"></i>
             <h5>暂无账号数据</h5>
             <p class="mb-0">请先添加账号</p>
@@ -1787,13 +1927,18 @@ function renderDefaultRepliesList(accounts, defaultReplies) {
     }
 
     accounts.forEach(accountId => {
-    const replySettings = defaultReplies[accountId] || { enabled: false, reply_content: '' };
+    const replySettings = defaultReplies[accountId] || { enabled: false, reply_content: '', reply_once: false };
     const tr = document.createElement('tr');
 
     // 状态标签
     const statusBadge = replySettings.enabled ?
         '<span class="badge bg-success">启用</span>' :
         '<span class="badge bg-secondary">禁用</span>';
+
+    // 只回复一次标签
+    const replyOnceBadge = replySettings.reply_once ?
+        '<span class="badge bg-warning">是</span>' :
+        '<span class="badge bg-light text-dark">否</span>';
 
     // 回复内容预览
     let contentPreview = replySettings.reply_content || '未设置';
@@ -1806,6 +1951,7 @@ function renderDefaultRepliesList(accounts, defaultReplies) {
         <strong class="text-primary">${accountId}</strong>
         </td>
         <td>${statusBadge}</td>
+        <td>${replyOnceBadge}</td>
         <td>
         <div class="text-truncate" style="max-width: 300px;" title="${replySettings.reply_content || ''}">
             ${contentPreview}
@@ -1819,6 +1965,11 @@ function renderDefaultRepliesList(accounts, defaultReplies) {
             <button class="btn btn-sm btn-outline-info" onclick="testDefaultReply('${accountId}')" title="测试">
             <i class="bi bi-play"></i>
             </button>
+            ${replySettings.reply_once ? `
+            <button class="btn btn-sm btn-outline-warning" onclick="clearDefaultReplyRecords('${accountId}')" title="清空记录">
+            <i class="bi bi-arrow-clockwise"></i>
+            </button>
+            ` : ''}
         </div>
         </td>
     `;
@@ -1837,7 +1988,7 @@ async function editDefaultReply(accountId) {
         }
     });
 
-    let settings = { enabled: false, reply_content: '' };
+    let settings = { enabled: false, reply_content: '', reply_once: false };
     if (response.ok) {
         settings = await response.json();
     }
@@ -1847,6 +1998,7 @@ async function editDefaultReply(accountId) {
     document.getElementById('editAccountIdDisplay').value = accountId;
     document.getElementById('editDefaultReplyEnabled').checked = settings.enabled;
     document.getElementById('editReplyContent').value = settings.reply_content || '';
+    document.getElementById('editReplyOnce').checked = settings.reply_once || false;
 
     // 根据启用状态显示/隐藏内容输入框
     toggleReplyContentVisibility();
@@ -1873,6 +2025,7 @@ async function saveDefaultReply() {
     const accountId = document.getElementById('editAccountId').value;
     const enabled = document.getElementById('editDefaultReplyEnabled').checked;
     const replyContent = document.getElementById('editReplyContent').value;
+    const replyOnce = document.getElementById('editReplyOnce').checked;
 
     if (enabled && !replyContent.trim()) {
         showToast('启用默认回复时必须设置回复内容', 'warning');
@@ -1881,7 +2034,8 @@ async function saveDefaultReply() {
 
     const data = {
         enabled: enabled,
-        reply_content: enabled ? replyContent : null
+        reply_content: enabled ? replyContent : null,
+        reply_once: replyOnce
     };
 
     const response = await fetch(`${apiBase}/default-replies/${accountId}`, {
@@ -1911,6 +2065,34 @@ async function saveDefaultReply() {
 // 测试默认回复（占位函数）
 function testDefaultReply(accountId) {
     showToast('测试功能开发中...', 'info');
+}
+
+// 清空默认回复记录
+async function clearDefaultReplyRecords(accountId) {
+    if (!confirm(`确定要清空账号 "${accountId}" 的默认回复记录吗？\n\n清空后，该账号将可以重新对之前回复过的对话进行默认回复。`)) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/default-replies/${accountId}/clear-records`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (response.ok) {
+            showToast(`账号 "${accountId}" 的默认回复记录已清空`, 'success');
+            loadDefaultReplies(); // 刷新列表
+        } else {
+            const error = await response.text();
+            showToast(`清空失败: ${error}`, 'danger');
+        }
+    } catch (error) {
+        console.error('清空默认回复记录失败:', error);
+        showToast('清空默认回复记录失败', 'danger');
+    }
 }
 
 // ==================== AI回复配置相关函数 ====================
@@ -4847,92 +5029,289 @@ async function loadItemsByCookie() {
 
 // 显示商品列表
 function displayItems(items) {
+    // 存储所有商品数据
+    allItemsData = items || [];
+
+    // 应用搜索过滤
+    applyItemsFilter();
+
+    // 显示当前页数据
+    displayCurrentPageItems();
+
+    // 更新分页控件
+    updateItemsPagination();
+}
+
+// 应用搜索过滤
+function applyItemsFilter() {
+    const searchKeyword = currentSearchKeyword.toLowerCase().trim();
+
+    if (!searchKeyword) {
+        filteredItemsData = [...allItemsData];
+    } else {
+        filteredItemsData = allItemsData.filter(item => {
+            const title = (item.item_title || '').toLowerCase();
+            const detail = getItemDetailText(item.item_detail || '').toLowerCase();
+            return title.includes(searchKeyword) || detail.includes(searchKeyword);
+        });
+    }
+
+    // 重置到第一页
+    currentItemsPage = 1;
+
+    // 计算总页数
+    totalItemsPages = Math.ceil(filteredItemsData.length / itemsPerPage);
+
+    // 更新搜索统计
+    updateItemsSearchStats();
+}
+
+// 获取商品详情的纯文本内容
+function getItemDetailText(itemDetail) {
+    if (!itemDetail) return '';
+
+    try {
+        // 尝试解析JSON
+        const detail = JSON.parse(itemDetail);
+        if (detail.content) {
+            return detail.content;
+        }
+        return itemDetail;
+    } catch (e) {
+        // 如果不是JSON格式，直接返回原文本
+        return itemDetail;
+    }
+}
+
+// 显示当前页的商品数据
+function displayCurrentPageItems() {
     const tbody = document.getElementById('itemsTableBody');
 
-    if (!items || items.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无商品数据</td></tr>';
-    // 重置选择状态
-    const selectAllCheckbox = document.getElementById('selectAllItems');
-    if (selectAllCheckbox) {
-        selectAllCheckbox.checked = false;
-        selectAllCheckbox.indeterminate = false;
-    }
-    updateBatchDeleteButton();
-    return;
+    if (!filteredItemsData || filteredItemsData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无商品数据</td></tr>';
+        resetItemsSelection();
+        return;
     }
 
-    const itemsHtml = items.map(item => {
-    // 处理商品标题显示
-    let itemTitleDisplay = item.item_title || '未设置';
-    if (itemTitleDisplay.length > 30) {
-        itemTitleDisplay = itemTitleDisplay.substring(0, 30) + '...';
-    }
+    // 计算当前页的数据范围
+    const startIndex = (currentItemsPage - 1) * itemsPerPage;
+    const endIndex = startIndex + itemsPerPage;
+    const currentPageItems = filteredItemsData.slice(startIndex, endIndex);
 
-    // 处理商品详情显示
-    let itemDetailDisplay = '未设置';
-    if (item.item_detail) {
-        try {
-        // 尝试解析JSON并提取有用信息
-        const detail = JSON.parse(item.item_detail);
-        if (detail.content) {
-            itemDetailDisplay = detail.content.substring(0, 50) + (detail.content.length > 50 ? '...' : '');
-        } else {
-            // 如果是纯文本或其他格式，直接显示前50个字符
-            itemDetailDisplay = item.item_detail.substring(0, 50) + (item.item_detail.length > 50 ? '...' : '');
+    const itemsHtml = currentPageItems.map(item => {
+        // 处理商品标题显示
+        let itemTitleDisplay = item.item_title || '未设置';
+        if (itemTitleDisplay.length > 30) {
+            itemTitleDisplay = itemTitleDisplay.substring(0, 30) + '...';
         }
-        } catch (e) {
-        // 如果不是JSON格式，直接显示前50个字符
-        itemDetailDisplay = item.item_detail.substring(0, 50) + (item.item_detail.length > 50 ? '...' : '');
+
+        // 处理商品详情显示
+        let itemDetailDisplay = '未设置';
+        if (item.item_detail) {
+            const detailText = getItemDetailText(item.item_detail);
+            itemDetailDisplay = detailText.substring(0, 50) + (detailText.length > 50 ? '...' : '');
         }
-    }
 
-    // 多规格状态显示
-    const isMultiSpec = item.is_multi_spec;
-    const multiSpecDisplay = isMultiSpec ?
-        '<span class="badge bg-success">多规格</span>' :
-        '<span class="badge bg-secondary">普通</span>';
+        // 多规格状态显示
+        const isMultiSpec = item.is_multi_spec;
+        const multiSpecDisplay = isMultiSpec ?
+            '<span class="badge bg-success">多规格</span>' :
+            '<span class="badge bg-secondary">普通</span>';
 
-    return `
-        <tr>
-        <td>
-            <input type="checkbox" name="itemCheckbox"
-                    data-cookie-id="${escapeHtml(item.cookie_id)}"
-                    data-item-id="${escapeHtml(item.item_id)}"
-                    onchange="updateSelectAllState()">
-        </td>
-        <td>${escapeHtml(item.cookie_id)}</td>
-        <td>${escapeHtml(item.item_id)}</td>
-        <td title="${escapeHtml(item.item_title || '未设置')}">${escapeHtml(itemTitleDisplay)}</td>
-        <td title="${escapeHtml(item.item_detail || '未设置')}">${escapeHtml(itemDetailDisplay)}</td>
-        <td>${multiSpecDisplay}</td>
-        <td>${formatDateTime(item.updated_at)}</td>
-        <td>
-            <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
-                <i class="bi bi-pencil"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
-                <i class="bi bi-trash"></i>
-            </button>
-            <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiSpec('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiSpec})" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
-                <i class="bi ${isMultiSpec ? 'bi-toggle-on' : 'bi-toggle-off'}"></i>
-            </button>
-            </div>
-        </td>
-        </tr>
-    `;
+        return `
+            <tr>
+            <td>
+                <input type="checkbox" name="itemCheckbox"
+                        data-cookie-id="${escapeHtml(item.cookie_id)}"
+                        data-item-id="${escapeHtml(item.item_id)}"
+                        onchange="updateSelectAllState()">
+            </td>
+            <td>${escapeHtml(item.cookie_id)}</td>
+            <td>${escapeHtml(item.item_id)}</td>
+            <td title="${escapeHtml(item.item_title || '未设置')}">${escapeHtml(itemTitleDisplay)}</td>
+            <td title="${escapeHtml(getItemDetailText(item.item_detail || ''))}">${escapeHtml(itemDetailDisplay)}</td>
+            <td>${multiSpecDisplay}</td>
+            <td>${formatDateTime(item.updated_at)}</td>
+            <td>
+                <div class="btn-group" role="group">
+                <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
+                    <i class="bi bi-pencil"></i>
+                </button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
+                    <i class="bi bi-trash"></i>
+                </button>
+                <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiSpec('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiSpec})" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
+                    <i class="bi ${isMultiSpec ? 'bi-toggle-on' : 'bi-toggle-off'}"></i>
+                </button>
+                </div>
+            </td>
+            </tr>
+        `;
     }).join('');
 
     // 更新表格内容
     tbody.innerHTML = itemsHtml;
 
     // 重置选择状态
+    resetItemsSelection();
+}
+
+// 重置商品选择状态
+function resetItemsSelection() {
     const selectAllCheckbox = document.getElementById('selectAllItems');
     if (selectAllCheckbox) {
-    selectAllCheckbox.checked = false;
-    selectAllCheckbox.indeterminate = false;
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
     }
     updateBatchDeleteButton();
+}
+
+// 商品搜索过滤函数
+function filterItems() {
+    const searchInput = document.getElementById('itemSearchInput');
+    currentSearchKeyword = searchInput ? searchInput.value : '';
+
+    // 应用过滤
+    applyItemsFilter();
+
+    // 显示当前页数据
+    displayCurrentPageItems();
+
+    // 更新分页控件
+    updateItemsPagination();
+}
+
+// 更新搜索统计信息
+function updateItemsSearchStats() {
+    const statsElement = document.getElementById('itemSearchStats');
+    const statsTextElement = document.getElementById('itemSearchStatsText');
+
+    if (!statsElement || !statsTextElement) return;
+
+    if (currentSearchKeyword) {
+        statsTextElement.textContent = `搜索"${currentSearchKeyword}"，找到 ${filteredItemsData.length} 个商品`;
+        statsElement.style.display = 'block';
+    } else {
+        statsElement.style.display = 'none';
+    }
+}
+
+// 更新分页控件
+function updateItemsPagination() {
+    const paginationElement = document.getElementById('itemsPagination');
+    const pageInfoElement = document.getElementById('itemsPageInfo');
+    const totalPagesElement = document.getElementById('itemsTotalPages');
+    const pageInputElement = document.getElementById('itemsPageInput');
+
+    if (!paginationElement) return;
+
+    // 分页控件总是显示
+    paginationElement.style.display = 'block';
+
+    // 更新页面信息
+    const startIndex = (currentItemsPage - 1) * itemsPerPage + 1;
+    const endIndex = Math.min(currentItemsPage * itemsPerPage, filteredItemsData.length);
+
+    if (pageInfoElement) {
+        pageInfoElement.textContent = `显示第 ${startIndex}-${endIndex} 条，共 ${filteredItemsData.length} 条记录`;
+    }
+
+    if (totalPagesElement) {
+        totalPagesElement.textContent = totalItemsPages;
+    }
+
+    if (pageInputElement) {
+        pageInputElement.value = currentItemsPage;
+        pageInputElement.max = totalItemsPages;
+    }
+
+    // 更新分页按钮状态
+    updateItemsPaginationButtons();
+}
+
+// 更新分页按钮状态
+function updateItemsPaginationButtons() {
+    const firstPageBtn = document.getElementById('itemsFirstPage');
+    const prevPageBtn = document.getElementById('itemsPrevPage');
+    const nextPageBtn = document.getElementById('itemsNextPage');
+    const lastPageBtn = document.getElementById('itemsLastPage');
+
+    if (firstPageBtn) firstPageBtn.disabled = currentItemsPage <= 1;
+    if (prevPageBtn) prevPageBtn.disabled = currentItemsPage <= 1;
+    if (nextPageBtn) nextPageBtn.disabled = currentItemsPage >= totalItemsPages;
+    if (lastPageBtn) lastPageBtn.disabled = currentItemsPage >= totalItemsPages;
+}
+
+// 跳转到指定页面
+function goToItemsPage(page) {
+    if (page < 1 || page > totalItemsPages) return;
+
+    currentItemsPage = page;
+    displayCurrentPageItems();
+    updateItemsPagination();
+}
+
+// 处理页面输入框的回车事件
+function handleItemsPageInput(event) {
+    if (event.key === 'Enter') {
+        const pageInput = event.target;
+        const page = parseInt(pageInput.value);
+
+        if (page >= 1 && page <= totalItemsPages) {
+            goToItemsPage(page);
+        } else {
+            pageInput.value = currentItemsPage;
+        }
+    }
+}
+
+// 改变每页显示数量
+function changeItemsPageSize() {
+    const pageSizeSelect = document.getElementById('itemsPageSize');
+    if (!pageSizeSelect) return;
+
+    itemsPerPage = parseInt(pageSizeSelect.value);
+
+    // 重新计算总页数
+    totalItemsPages = Math.ceil(filteredItemsData.length / itemsPerPage);
+
+    // 调整当前页码，确保不超出范围
+    if (currentItemsPage > totalItemsPages) {
+        currentItemsPage = Math.max(1, totalItemsPages);
+    }
+
+    // 重新显示数据
+    displayCurrentPageItems();
+    updateItemsPagination();
+}
+
+// 初始化商品搜索功能
+function initItemsSearch() {
+    // 初始化分页大小
+    const pageSizeSelect = document.getElementById('itemsPageSize');
+    if (pageSizeSelect) {
+        itemsPerPage = parseInt(pageSizeSelect.value) || 20;
+        pageSizeSelect.addEventListener('change', changeItemsPageSize);
+    }
+
+    // 初始化搜索输入框事件监听器
+    const searchInput = document.getElementById('itemSearchInput');
+    if (searchInput) {
+        // 使用防抖来避免频繁搜索
+        let searchTimeout;
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                filterItems();
+            }, 300); // 300ms 防抖延迟
+        });
+    }
+
+    // 初始化页面输入框事件监听器
+    const pageInput = document.getElementById('itemsPageInput');
+    if (pageInput) {
+        pageInput.addEventListener('keydown', handleItemsPageInput);
+    }
 }
 
 // 刷新商品列表
@@ -6134,16 +6513,17 @@ async function addImageKeyword() {
             const modal = bootstrap.Modal.getInstance(document.getElementById('addImageKeywordModal'));
             modal.hide();
 
-            // 重新加载关键词列表
-            loadAccountKeywords();
-            clearKeywordCache();
+            // 只刷新关键词列表，不重新加载整个界面
+            await refreshKeywordsList();
         } else {
             try {
                 const errorData = await response.json();
                 let errorMessage = errorData.detail || '图片关键词添加失败';
 
                 // 根据不同的错误类型提供更友好的提示
-                if (errorMessage.includes('图片尺寸过大')) {
+                if (errorMessage.includes('关键词') && (errorMessage.includes('已存在') || errorMessage.includes('重复'))) {
+                    errorMessage = `❌ 关键词重复：${errorMessage}`;
+                } else if (errorMessage.includes('图片尺寸过大')) {
                     errorMessage = '❌ 图片尺寸过大，请选择尺寸较小的图片（建议不超过4096x4096像素）';
                 } else if (errorMessage.includes('图片像素总数过大')) {
                     errorMessage = '❌ 图片像素总数过大，请选择分辨率较低的图片';
@@ -6291,3 +6671,1044 @@ async function exportKeywords() {
         toggleLoading(false);
     }
 }
+
+// ==================== 备注管理功能 ====================
+
+// 编辑备注
+function editRemark(cookieId, currentRemark) {
+    console.log('editRemark called:', cookieId, currentRemark); // 调试信息
+    const remarkCell = document.querySelector(`[data-cookie-id="${cookieId}"] .remark-display`);
+    if (!remarkCell) {
+        console.log('remarkCell not found'); // 调试信息
+        return;
+    }
+
+    // 创建输入框
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'form-control form-control-sm';
+    input.value = currentRemark || '';
+    input.placeholder = '请输入备注...';
+    input.style.fontSize = '0.875rem';
+    input.maxLength = 100; // 限制备注长度
+
+    // 保存原始内容和原始值
+    const originalContent = remarkCell.innerHTML;
+    const originalValue = currentRemark || '';
+
+    // 标记是否已经进行了编辑
+    let hasChanged = false;
+    let isProcessing = false; // 防止重复处理
+
+    // 替换为输入框
+    remarkCell.innerHTML = '';
+    remarkCell.appendChild(input);
+
+    // 监听输入变化
+    input.addEventListener('input', () => {
+        hasChanged = input.value.trim() !== originalValue;
+    });
+
+    // 保存函数
+    const saveRemark = async () => {
+        console.log('saveRemark called, isProcessing:', isProcessing, 'hasChanged:', hasChanged); // 调试信息
+        if (isProcessing) return; // 防止重复调用
+
+        const newRemark = input.value.trim();
+        console.log('newRemark:', newRemark, 'originalValue:', originalValue); // 调试信息
+
+        // 如果没有变化，直接恢复显示
+        if (!hasChanged || newRemark === originalValue) {
+            console.log('No changes detected, restoring original content'); // 调试信息
+            remarkCell.innerHTML = originalContent;
+            return;
+        }
+
+        isProcessing = true;
+
+        try {
+            const response = await fetch(`${apiBase}/cookies/${cookieId}/remark`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: JSON.stringify({ remark: newRemark })
+            });
+
+            if (response.ok) {
+                // 更新显示
+                remarkCell.innerHTML = `
+                    <span class="remark-display" onclick="editRemark('${cookieId}', '${newRemark.replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                        ${newRemark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
+                    </span>
+                `;
+                showToast('备注更新成功', 'success');
+            } else {
+                const errorData = await response.json();
+                showToast(`备注更新失败: ${errorData.detail || '未知错误'}`, 'danger');
+                // 恢复原始内容
+                remarkCell.innerHTML = originalContent;
+            }
+        } catch (error) {
+            console.error('更新备注失败:', error);
+            showToast('备注更新失败', 'danger');
+            // 恢复原始内容
+            remarkCell.innerHTML = originalContent;
+        } finally {
+            isProcessing = false;
+        }
+    };
+
+    // 取消函数
+    const cancelEdit = () => {
+        if (isProcessing) return;
+        remarkCell.innerHTML = originalContent;
+    };
+
+    // 延迟绑定blur事件，避免立即触发
+    setTimeout(() => {
+        input.addEventListener('blur', saveRemark);
+    }, 100);
+
+    // 绑定键盘事件
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            saveRemark();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelEdit();
+        }
+    });
+
+    // 聚焦并选中文本
+    input.focus();
+    input.select();
+}
+
+// 编辑暂停时间
+function editPauseDuration(cookieId, currentDuration) {
+    console.log('editPauseDuration called:', cookieId, currentDuration); // 调试信息
+    const pauseCell = document.querySelector(`[data-cookie-id="${cookieId}"] .pause-duration-display`);
+    if (!pauseCell) {
+        console.log('pauseCell not found'); // 调试信息
+        return;
+    }
+
+    // 创建输入框
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'form-control form-control-sm';
+    input.value = currentDuration || 10;
+    input.placeholder = '请输入暂停时间...';
+    input.style.fontSize = '0.875rem';
+    input.min = 1;
+    input.max = 60;
+    input.step = 1;
+
+    // 保存原始内容和原始值
+    const originalContent = pauseCell.innerHTML;
+    const originalValue = currentDuration || 10;
+
+    // 标记是否已经进行了编辑
+    let hasChanged = false;
+    let isProcessing = false; // 防止重复处理
+
+    // 替换为输入框
+    pauseCell.innerHTML = '';
+    pauseCell.appendChild(input);
+
+    // 监听输入变化
+    input.addEventListener('input', () => {
+        const newValue = parseInt(input.value) || 10;
+        hasChanged = newValue !== originalValue;
+    });
+
+    // 保存函数
+    const savePauseDuration = async () => {
+        console.log('savePauseDuration called, isProcessing:', isProcessing, 'hasChanged:', hasChanged); // 调试信息
+        if (isProcessing) return; // 防止重复调用
+
+        const newDuration = parseInt(input.value) || 10;
+        console.log('newDuration:', newDuration, 'originalValue:', originalValue); // 调试信息
+
+        // 验证范围
+        if (newDuration < 1 || newDuration > 60) {
+            showToast('暂停时间必须在1-60分钟之间', 'warning');
+            input.focus();
+            return;
+        }
+
+        // 如果没有变化，直接恢复显示
+        if (!hasChanged || newDuration === originalValue) {
+            console.log('No changes detected, restoring original content'); // 调试信息
+            pauseCell.innerHTML = originalContent;
+            return;
+        }
+
+        isProcessing = true;
+
+        try {
+            const response = await fetch(`${apiBase}/cookies/${cookieId}/pause-duration`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: JSON.stringify({ pause_duration: newDuration })
+            });
+
+            if (response.ok) {
+                // 更新显示
+                pauseCell.innerHTML = `
+                    <span class="pause-duration-display" onclick="editPauseDuration('${cookieId}', ${newDuration})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
+                        <i class="bi bi-clock me-1"></i>${newDuration}分钟
+                    </span>
+                `;
+                showToast('暂停时间更新成功', 'success');
+            } else {
+                const errorData = await response.json();
+                showToast(`暂停时间更新失败: ${errorData.detail || '未知错误'}`, 'danger');
+                // 恢复原始内容
+                pauseCell.innerHTML = originalContent;
+            }
+        } catch (error) {
+            console.error('更新暂停时间失败:', error);
+            showToast('暂停时间更新失败', 'danger');
+            // 恢复原始内容
+            pauseCell.innerHTML = originalContent;
+        } finally {
+            isProcessing = false;
+        }
+    };
+
+    // 取消函数
+    const cancelEdit = () => {
+        if (isProcessing) return;
+        pauseCell.innerHTML = originalContent;
+    };
+
+    // 延迟绑定blur事件，避免立即触发
+    setTimeout(() => {
+        input.addEventListener('blur', savePauseDuration);
+    }, 100);
+
+    // 绑定键盘事件
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            savePauseDuration();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelEdit();
+        }
+    });
+
+    // 聚焦并选中文本
+    input.focus();
+    input.select();
+}
+
+// ==================== 工具提示初始化 ====================
+
+// 初始化工具提示
+function initTooltips() {
+    // 初始化所有工具提示
+    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+    tooltipTriggerList.map(function (tooltipTriggerEl) {
+        return new bootstrap.Tooltip(tooltipTriggerEl);
+    });
+}
+
+// ==================== 系统设置功能 ====================
+
+// 加载系统设置
+async function loadSystemSettings() {
+    console.log('加载系统设置');
+
+    // 通过验证接口获取用户信息（更可靠）
+    try {
+        const response = await fetch(`${apiBase}/verify`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+            const isAdmin = result.is_admin === true;
+
+            console.log('用户信息:', result, '是否管理员:', isAdmin);
+
+            // 显示/隐藏注册设置（仅管理员可见）
+            const registrationSettings = document.getElementById('registration-settings');
+            if (registrationSettings) {
+                registrationSettings.style.display = isAdmin ? 'block' : 'none';
+            }
+
+            // 如果是管理员，加载注册设置
+            if (isAdmin) {
+                await loadRegistrationSettings();
+            }
+        }
+    } catch (error) {
+        console.error('获取用户信息失败:', error);
+        // 出错时隐藏管理员功能
+        const registrationSettings = document.getElementById('registration-settings');
+        if (registrationSettings) {
+            registrationSettings.style.display = 'none';
+        }
+    }
+}
+
+// 加载注册设置
+async function loadRegistrationSettings() {
+    try {
+        const response = await fetch('/registration-status');
+        if (response.ok) {
+            const data = await response.json();
+            const checkbox = document.getElementById('registrationEnabled');
+            if (checkbox) {
+                checkbox.checked = data.enabled;
+            }
+        }
+    } catch (error) {
+        console.error('加载注册设置失败:', error);
+        showToast('加载注册设置失败', 'danger');
+    }
+}
+
+// 更新注册设置
+async function updateRegistrationSettings() {
+    const checkbox = document.getElementById('registrationEnabled');
+    const statusDiv = document.getElementById('registrationStatus');
+    const statusText = document.getElementById('registrationStatusText');
+
+    if (!checkbox) return;
+
+    const enabled = checkbox.checked;
+
+    try {
+        const response = await fetch('/registration-settings', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ enabled: enabled })
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            showToast(data.message, 'success');
+
+            // 显示状态信息
+            if (statusDiv && statusText) {
+                statusText.textContent = data.message;
+                statusDiv.style.display = 'block';
+
+                // 3秒后隐藏状态信息
+                setTimeout(() => {
+                    statusDiv.style.display = 'none';
+                }, 3000);
+            }
+        } else {
+            const errorData = await response.json();
+            showToast(`更新失败: ${errorData.detail || '未知错误'}`, 'danger');
+        }
+    } catch (error) {
+        console.error('更新注册设置失败:', error);
+        showToast('更新注册设置失败', 'danger');
+    }
+}
+
+// ================================
+// 订单管理功能
+// ================================
+
+// 加载订单列表
+async function loadOrders() {
+    try {
+        // 先加载Cookie列表用于筛选
+        await loadOrderCookieFilter();
+
+        // 加载订单列表
+        await refreshOrdersData();
+    } catch (error) {
+        console.error('加载订单列表失败:', error);
+        showToast('加载订单列表失败', 'danger');
+    }
+}
+
+// 只刷新订单数据，不重新加载筛选器
+async function refreshOrdersData() {
+    try {
+        const selectedCookie = document.getElementById('orderCookieFilter').value;
+        if (selectedCookie) {
+            await loadOrdersByCookie();
+        } else {
+            await loadAllOrders();
+        }
+    } catch (error) {
+        console.error('刷新订单数据失败:', error);
+        showToast('刷新订单数据失败', 'danger');
+    }
+}
+
+// 加载Cookie筛选选项
+async function loadOrderCookieFilter() {
+    try {
+        const response = await fetch(`${apiBase}/admin/data/orders`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        const data = await response.json();
+        if (data.success && data.data) {
+            // 提取唯一的cookie_id
+            const cookieIds = [...new Set(data.data.map(order => order.cookie_id).filter(id => id))];
+
+            const select = document.getElementById('orderCookieFilter');
+            if (select) {
+                select.innerHTML = '<option value="">所有账号</option>';
+
+                cookieIds.forEach(cookieId => {
+                    const option = document.createElement('option');
+                    option.value = cookieId;
+                    option.textContent = cookieId;
+                    select.appendChild(option);
+                });
+            }
+        }
+    } catch (error) {
+        console.error('加载Cookie选项失败:', error);
+    }
+}
+
+// 加载所有订单
+async function loadAllOrders() {
+    try {
+        const response = await fetch(`${apiBase}/admin/data/orders`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            allOrdersData = data.data || [];
+            // 按创建时间倒序排列
+            allOrdersData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            // 应用当前筛选条件
+            filterOrders();
+        } else {
+            console.error('加载订单失败:', data.message);
+            showToast('加载订单数据失败: ' + data.message, 'danger');
+        }
+    } catch (error) {
+        console.error('加载订单失败:', error);
+        showToast('加载订单数据失败，请检查网络连接', 'danger');
+    }
+}
+
+// 根据Cookie加载订单
+async function loadOrdersByCookie() {
+    const selectedCookie = document.getElementById('orderCookieFilter').value;
+    if (!selectedCookie) {
+        await loadAllOrders();
+        return;
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/admin/data/orders`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            // 筛选指定Cookie的订单
+            allOrdersData = (data.data || []).filter(order => order.cookie_id === selectedCookie);
+            // 按创建时间倒序排列
+            allOrdersData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            // 应用当前筛选条件
+            filterOrders();
+        } else {
+            console.error('加载订单失败:', data.message);
+            showToast('加载订单数据失败: ' + data.message, 'danger');
+        }
+    } catch (error) {
+        console.error('加载订单失败:', error);
+        showToast('加载订单数据失败，请检查网络连接', 'danger');
+    }
+}
+
+// 筛选订单
+function filterOrders() {
+    const searchKeyword = document.getElementById('orderSearchInput')?.value.toLowerCase() || '';
+    const statusFilter = document.getElementById('orderStatusFilter')?.value || '';
+
+    filteredOrdersData = allOrdersData.filter(order => {
+        // 搜索关键词筛选（订单ID或商品ID）
+        const matchesSearch = !searchKeyword ||
+            (order.order_id && order.order_id.toLowerCase().includes(searchKeyword)) ||
+            (order.item_id && order.item_id.toLowerCase().includes(searchKeyword));
+
+        // 状态筛选
+        const matchesStatus = !statusFilter || order.order_status === statusFilter;
+
+        return matchesSearch && matchesStatus;
+    });
+
+    currentOrderSearchKeyword = searchKeyword;
+    currentOrdersPage = 1; // 重置到第一页
+
+    updateOrdersDisplay();
+}
+
+// 更新订单显示
+function updateOrdersDisplay() {
+    displayOrders();
+    updateOrdersPagination();
+    updateOrdersSearchStats();
+}
+
+// 显示订单列表
+function displayOrders() {
+    const tbody = document.getElementById('ordersTableBody');
+    if (!tbody) return;
+
+    if (filteredOrdersData.length === 0) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="10" class="text-center text-muted py-4">
+                    <i class="bi bi-inbox display-6 d-block mb-2"></i>
+                    ${currentOrderSearchKeyword ? '没有找到匹配的订单' : '暂无订单数据'}
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    // 计算分页
+    totalOrdersPages = Math.ceil(filteredOrdersData.length / ordersPerPage);
+    const startIndex = (currentOrdersPage - 1) * ordersPerPage;
+    const endIndex = startIndex + ordersPerPage;
+    const pageOrders = filteredOrdersData.slice(startIndex, endIndex);
+
+    // 生成表格行
+    tbody.innerHTML = pageOrders.map(order => createOrderRow(order)).join('');
+}
+
+// 创建订单行HTML
+function createOrderRow(order) {
+    const statusClass = getOrderStatusClass(order.order_status);
+    const statusText = getOrderStatusText(order.order_status);
+
+    return `
+        <tr>
+            <td>
+                <input type="checkbox" class="order-checkbox" value="${order.order_id}">
+            </td>
+            <td>
+                <span class="text-truncate d-inline-block" style="max-width: 120px;" title="${order.order_id}">
+                    ${order.order_id}
+                </span>
+            </td>
+            <td>
+                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${order.item_id || ''}">
+                    ${order.item_id || '-'}
+                </span>
+            </td>
+            <td>
+                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.buyer_id || ''}">
+                    ${order.buyer_id || '-'}
+                </span>
+            </td>
+            <td>
+                ${order.spec_name && order.spec_value ?
+                    `<small class="text-muted">${order.spec_name}:</small><br>${order.spec_value}` :
+                    '-'
+                }
+            </td>
+            <td>${order.quantity || '-'}</td>
+            <td>
+                <span class="text-success fw-bold">¥${order.amount || '0.00'}</span>
+            </td>
+            <td>
+                <span class="badge ${statusClass}">${statusText}</span>
+            </td>
+            <td>
+                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.cookie_id || ''}">
+                    ${order.cookie_id || '-'}
+                </span>
+            </td>
+            <td>
+                <div class="btn-group btn-group-sm" role="group">
+                    <button class="btn btn-outline-primary btn-sm" onclick="showOrderDetail('${order.order_id}')" title="查看详情">
+                        <i class="bi bi-eye"></i>
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="deleteOrder('${order.order_id}')" title="删除">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `;
+}
+
+// 获取订单状态样式类
+function getOrderStatusClass(status) {
+    const statusMap = {
+        'processing': 'bg-warning text-dark',
+        'processed': 'bg-info text-white',
+        'completed': 'bg-success text-white',
+        'unknown': 'bg-secondary text-white'
+    };
+    return statusMap[status] || 'bg-secondary text-white';
+}
+
+// 获取订单状态文本
+function getOrderStatusText(status) {
+    const statusMap = {
+        'processing': '处理中',
+        'processed': '已处理',
+        'completed': '已完成',
+        'unknown': '未知'
+    };
+    return statusMap[status] || '未知';
+}
+
+// 更新订单分页
+function updateOrdersPagination() {
+    const pageInfo = document.getElementById('ordersPageInfo');
+    const pageInput = document.getElementById('ordersPageInput');
+    const totalPagesSpan = document.getElementById('ordersTotalPages');
+
+    if (pageInfo) {
+        const startIndex = (currentOrdersPage - 1) * ordersPerPage + 1;
+        const endIndex = Math.min(currentOrdersPage * ordersPerPage, filteredOrdersData.length);
+        pageInfo.textContent = `显示第 ${startIndex}-${endIndex} 条，共 ${filteredOrdersData.length} 条记录`;
+    }
+
+    if (pageInput) {
+        pageInput.value = currentOrdersPage;
+    }
+
+    if (totalPagesSpan) {
+        totalPagesSpan.textContent = totalOrdersPages;
+    }
+
+    // 更新分页按钮状态
+    const firstPageBtn = document.getElementById('ordersFirstPage');
+    const prevPageBtn = document.getElementById('ordersPrevPage');
+    const nextPageBtn = document.getElementById('ordersNextPage');
+    const lastPageBtn = document.getElementById('ordersLastPage');
+
+    if (firstPageBtn) firstPageBtn.disabled = currentOrdersPage === 1;
+    if (prevPageBtn) prevPageBtn.disabled = currentOrdersPage === 1;
+    if (nextPageBtn) nextPageBtn.disabled = currentOrdersPage === totalOrdersPages || totalOrdersPages === 0;
+    if (lastPageBtn) lastPageBtn.disabled = currentOrdersPage === totalOrdersPages || totalOrdersPages === 0;
+}
+
+// 更新搜索统计信息
+function updateOrdersSearchStats() {
+    const searchStats = document.getElementById('orderSearchStats');
+    const searchStatsText = document.getElementById('orderSearchStatsText');
+
+    if (searchStats && searchStatsText) {
+        if (currentOrderSearchKeyword) {
+            searchStatsText.textContent = `搜索 "${currentOrderSearchKeyword}" 找到 ${filteredOrdersData.length} 个结果`;
+            searchStats.style.display = 'block';
+        } else {
+            searchStats.style.display = 'none';
+        }
+    }
+}
+
+// 跳转到指定页面
+function goToOrdersPage(page) {
+    if (page < 1 || page > totalOrdersPages) return;
+
+    currentOrdersPage = page;
+    updateOrdersDisplay();
+}
+
+// 初始化订单搜索功能
+function initOrdersSearch() {
+    // 初始化分页大小
+    const pageSizeSelect = document.getElementById('ordersPageSize');
+    if (pageSizeSelect) {
+        ordersPerPage = parseInt(pageSizeSelect.value) || 20;
+        pageSizeSelect.addEventListener('change', changeOrdersPageSize);
+    }
+
+    // 初始化搜索输入框事件监听器
+    const searchInput = document.getElementById('orderSearchInput');
+    if (searchInput) {
+        // 使用防抖来避免频繁搜索
+        let searchTimeout;
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                filterOrders();
+            }, 300); // 300ms 防抖延迟
+        });
+    }
+
+    // 初始化页面输入框事件监听器
+    const pageInput = document.getElementById('ordersPageInput');
+    if (pageInput) {
+        pageInput.addEventListener('keydown', handleOrdersPageInput);
+    }
+}
+
+// 处理分页大小变化
+function changeOrdersPageSize() {
+    const pageSizeSelect = document.getElementById('ordersPageSize');
+    if (pageSizeSelect) {
+        ordersPerPage = parseInt(pageSizeSelect.value) || 20;
+        currentOrdersPage = 1; // 重置到第一页
+        updateOrdersDisplay();
+    }
+}
+
+// 处理页面输入
+function handleOrdersPageInput(event) {
+    if (event.key === 'Enter') {
+        const pageInput = document.getElementById('ordersPageInput');
+        if (pageInput) {
+            const page = parseInt(pageInput.value);
+            if (page >= 1 && page <= totalOrdersPages) {
+                goToOrdersPage(page);
+            } else {
+                pageInput.value = currentOrdersPage; // 恢复当前页码
+                showToast('页码超出范围', 'warning');
+            }
+        }
+    }
+}
+
+// 刷新订单列表
+async function refreshOrders() {
+    await refreshOrdersData();
+    showToast('订单列表已刷新', 'success');
+}
+
+// 清空订单筛选条件
+function clearOrderFilters() {
+    const searchInput = document.getElementById('orderSearchInput');
+    const statusFilter = document.getElementById('orderStatusFilter');
+    const cookieFilter = document.getElementById('orderCookieFilter');
+
+    if (searchInput) searchInput.value = '';
+    if (statusFilter) statusFilter.value = '';
+    if (cookieFilter) cookieFilter.value = '';
+
+    filterOrders();
+    showToast('筛选条件已清空', 'info');
+}
+
+// 显示订单详情
+async function showOrderDetail(orderId) {
+    try {
+        const order = allOrdersData.find(o => o.order_id === orderId);
+        if (!order) {
+            showToast('订单不存在', 'warning');
+            return;
+        }
+
+        // 创建模态框内容
+        const modalContent = `
+            <div class="modal fade" id="orderDetailModal" tabindex="-1">
+                <div class="modal-dialog modal-lg">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">
+                                <i class="bi bi-receipt-cutoff me-2"></i>
+                                订单详情
+                            </h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <h6>基本信息</h6>
+                                    <table class="table table-sm">
+                                        <tr><td>订单ID</td><td>${order.order_id}</td></tr>
+                                        <tr><td>商品ID</td><td>${order.item_id || '未知'}</td></tr>
+                                        <tr><td>买家ID</td><td>${order.buyer_id || '未知'}</td></tr>
+                                        <tr><td>Cookie账号</td><td>${order.cookie_id || '未知'}</td></tr>
+                                        <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${getOrderStatusText(order.order_status)}</span></td></tr>
+                                    </table>
+                                </div>
+                                <div class="col-md-6">
+                                    <h6>商品信息</h6>
+                                    <table class="table table-sm">
+                                        <tr><td>规格名称</td><td>${order.spec_name || '无'}</td></tr>
+                                        <tr><td>规格值</td><td>${order.spec_value || '无'}</td></tr>
+                                        <tr><td>数量</td><td>${order.quantity || '1'}</td></tr>
+                                        <tr><td>金额</td><td>¥${order.amount || '0.00'}</td></tr>
+                                    </table>
+                                </div>
+                            </div>
+                            <div class="row mt-3">
+                                <div class="col-12">
+                                    <h6>时间信息</h6>
+                                    <table class="table table-sm">
+                                        <tr><td>创建时间</td><td>${formatDateTime(order.created_at)}</td></tr>
+                                        <tr><td>更新时间</td><td>${formatDateTime(order.updated_at)}</td></tr>
+                                    </table>
+                                </div>
+                            </div>
+                            <div class="row mt-3">
+                                <div class="col-12">
+                                    <h6>商品详情</h6>
+                                    <div id="itemDetailContent">
+                                        <div class="text-center">
+                                            <div class="spinner-border spinner-border-sm" role="status">
+                                                <span class="visually-hidden">加载中...</span>
+                                            </div>
+                                            <span class="ms-2">正在加载商品详情...</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        // 移除已存在的模态框
+        const existingModal = document.getElementById('orderDetailModal');
+        if (existingModal) {
+            existingModal.remove();
+        }
+
+        // 添加新模态框到页面
+        document.body.insertAdjacentHTML('beforeend', modalContent);
+
+        // 显示模态框
+        const modal = new bootstrap.Modal(document.getElementById('orderDetailModal'));
+        modal.show();
+
+        // 异步加载商品详情
+        if (order.item_id) {
+            loadItemDetailForOrder(order.item_id, order.cookie_id);
+        }
+
+    } catch (error) {
+        console.error('显示订单详情失败:', error);
+        showToast('显示订单详情失败', 'danger');
+    }
+}
+
+// 为订单加载商品详情
+async function loadItemDetailForOrder(itemId, cookieId) {
+    try {
+        const token = localStorage.getItem('auth_token');
+
+        // 尝试从数据库获取商品信息
+        let response = await fetch(`${apiBase}/items/${cookieId}/${itemId}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            }
+        });
+
+        const content = document.getElementById('itemDetailContent');
+        if (!content) return;
+
+        if (response.ok) {
+            const data = await response.json();
+            const item = data.item;
+
+            content.innerHTML = `
+                <div class="card">
+                    <div class="card-body">
+                        <h6 class="card-title">${item.item_title || '商品标题未知'}</h6>
+                        <p class="card-text">${item.item_description || '暂无描述'}</p>
+                        <div class="row">
+                            <div class="col-md-6">
+                                <small class="text-muted">分类：${item.item_category || '未知'}</small>
+                            </div>
+                            <div class="col-md-6">
+                                <small class="text-muted">价格：${item.item_price || '未知'}</small>
+                            </div>
+                        </div>
+                        ${item.item_detail ? `
+                            <div class="mt-2">
+                                <small class="text-muted">详情：</small>
+                                <div class="border p-2 mt-1" style="max-height: 200px; overflow-y: auto;">
+                                    <small>${item.item_detail}</small>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `;
+        } else {
+            content.innerHTML = `
+                <div class="alert alert-warning">
+                    <i class="bi bi-exclamation-triangle me-2"></i>
+                    无法获取商品详情信息
+                </div>
+            `;
+        }
+    } catch (error) {
+        console.error('加载商品详情失败:', error);
+        const content = document.getElementById('itemDetailContent');
+        if (content) {
+            content.innerHTML = `
+                <div class="alert alert-danger">
+                    <i class="bi bi-exclamation-triangle me-2"></i>
+                    加载商品详情失败：${error.message}
+                </div>
+            `;
+        }
+    }
+}
+
+// 删除订单
+async function deleteOrder(orderId) {
+    try {
+        const confirmed = confirm(`确定要删除订单吗？\n\n订单ID: ${orderId}\n\n此操作不可撤销！`);
+        if (!confirmed) {
+            return;
+        }
+
+        const response = await fetch(`${apiBase}/admin/data/orders/delete`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ record_id: orderId })
+        });
+
+        if (response.ok) {
+            showToast('订单删除成功', 'success');
+            // 刷新列表
+            await refreshOrdersData();
+        } else {
+            const error = await response.text();
+            showToast(`删除失败: ${error}`, 'danger');
+        }
+    } catch (error) {
+        console.error('删除订单失败:', error);
+        showToast('删除订单失败', 'danger');
+    }
+}
+
+// 批量删除订单
+async function batchDeleteOrders() {
+    const checkboxes = document.querySelectorAll('.order-checkbox:checked');
+    if (checkboxes.length === 0) {
+        showToast('请先选择要删除的订单', 'warning');
+        return;
+    }
+
+    const orderIds = Array.from(checkboxes).map(cb => cb.value);
+    const confirmed = confirm(`确定要删除选中的 ${orderIds.length} 个订单吗？\n\n此操作不可撤销！`);
+
+    if (!confirmed) return;
+
+    try {
+        let successCount = 0;
+        let failCount = 0;
+
+        for (const orderId of orderIds) {
+            try {
+                const response = await fetch(`${apiBase}/admin/data/orders/delete`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({ record_id: orderId })
+                });
+
+                if (response.ok) {
+                    successCount++;
+                } else {
+                    failCount++;
+                }
+            } catch (error) {
+                failCount++;
+            }
+        }
+
+        if (successCount > 0) {
+            showToast(`成功删除 ${successCount} 个订单${failCount > 0 ? `，${failCount} 个失败` : ''}`,
+                     failCount > 0 ? 'warning' : 'success');
+            await refreshOrdersData();
+        } else {
+            showToast('批量删除失败', 'danger');
+        }
+
+    } catch (error) {
+        console.error('批量删除订单失败:', error);
+        showToast('批量删除订单失败', 'danger');
+    }
+}
+
+// 切换全选订单
+function toggleSelectAllOrders(checkbox) {
+    const orderCheckboxes = document.querySelectorAll('.order-checkbox');
+    orderCheckboxes.forEach(cb => {
+        cb.checked = checkbox.checked;
+    });
+
+    updateBatchDeleteOrdersButton();
+}
+
+// 更新批量删除按钮状态
+function updateBatchDeleteOrdersButton() {
+    const checkboxes = document.querySelectorAll('.order-checkbox:checked');
+    const batchDeleteBtn = document.getElementById('batchDeleteOrdersBtn');
+
+    if (batchDeleteBtn) {
+        batchDeleteBtn.disabled = checkboxes.length === 0;
+    }
+}
+
+// 格式化日期时间
+function formatDateTime(dateString) {
+    if (!dateString) return '未知时间';
+
+    try {
+        const date = new Date(dateString);
+        return date.toLocaleString('zh-CN', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } catch (error) {
+        return dateString;
+    }
+}
+
+// 页面加载完成后初始化订单搜索功能
+document.addEventListener('DOMContentLoaded', function() {
+    // 延迟初始化，确保DOM完全加载
+    setTimeout(() => {
+        initOrdersSearch();
+
+        // 绑定复选框变化事件
+        document.addEventListener('change', function(e) {
+            if (e.target.classList.contains('order-checkbox')) {
+                updateBatchDeleteOrdersButton();
+            }
+        });
+    }, 100);
+});

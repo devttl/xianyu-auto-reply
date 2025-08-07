@@ -113,6 +113,8 @@ class DBManager:
                 value TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 auto_confirm INTEGER DEFAULT 1,
+                remark TEXT DEFAULT '',
+                pause_duration INTEGER DEFAULT 10,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -210,6 +212,24 @@ class DBManager:
             )
             ''')
 
+            # 创建订单表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                item_id TEXT,
+                buyer_id TEXT,
+                spec_name TEXT,
+                spec_value TEXT,
+                quantity TEXT,
+                amount TEXT,
+                order_status TEXT DEFAULT 'unknown',
+                cookie_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             # 检查并添加 user_id 列（用于数据库迁移）
             try:
                 self._execute_sql(cursor, "SELECT user_id FROM cards LIMIT 1")
@@ -279,8 +299,30 @@ class DBManager:
                 cookie_id TEXT PRIMARY KEY,
                 enabled BOOLEAN DEFAULT FALSE,
                 reply_content TEXT,
+                reply_once BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
+            # 添加 reply_once 字段（如果不存在）
+            try:
+                cursor.execute('ALTER TABLE default_replies ADD COLUMN reply_once BOOLEAN DEFAULT FALSE')
+                self.conn.commit()
+                logger.info("已添加 reply_once 字段到 default_replies 表")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    logger.warning(f"添加 reply_once 字段失败: {e}")
+
+            # 创建默认回复记录表（记录已回复的chat_id）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS default_reply_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(cookie_id, chat_id),
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
@@ -341,7 +383,8 @@ class DBManager:
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
-            ('theme_color', 'blue', '主题颜色')
+            ('theme_color', 'blue', '主题颜色'),
+            ('registration_enabled', 'true', '是否开启用户注册')
             ''')
 
             # 检查并升级数据库
@@ -371,6 +414,21 @@ class DBManager:
 
             # 检查并更新CHECK约束（重建表以支持image类型）
             self._update_cards_table_constraints(cursor)
+
+            # 检查cookies表是否存在remark列
+            cursor.execute("PRAGMA table_info(cookies)")
+            cookie_columns = [column[1] for column in cursor.fetchall()]
+
+            if 'remark' not in cookie_columns:
+                logger.info("添加cookies表的remark列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN remark TEXT DEFAULT ''")
+                logger.info("数据库迁移完成：添加remark列")
+
+            # 检查cookies表是否存在pause_duration列
+            if 'pause_duration' not in cookie_columns:
+                logger.info("添加cookies表的pause_duration列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN pause_duration INTEGER DEFAULT 10")
+                logger.info("数据库迁移完成：添加pause_duration列")
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
@@ -1077,11 +1135,11 @@ class DBManager:
                 return None
 
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
-        """获取Cookie的详细信息，包括user_id和auto_confirm"""
+        """获取Cookie的详细信息，包括user_id、auto_confirm、remark和pause_duration"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     return {
@@ -1089,7 +1147,9 @@ class DBManager:
                         'value': result[1],
                         'user_id': result[2],
                         'auto_confirm': bool(result[3]),
-                        'created_at': result[4]
+                        'remark': result[4] or '',
+                        'pause_duration': result[5] or 10,
+                        'created_at': result[6]
                     }
                 return None
             except Exception as e:
@@ -1108,6 +1168,46 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新自动确认发货设置失败: {e}")
                 return False
+
+    def update_cookie_remark(self, cookie_id: str, remark: str) -> bool:
+        """更新Cookie的备注"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET remark = ? WHERE id = ?", (remark, cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 备注: {remark}")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号备注失败: {e}")
+                return False
+
+    def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:
+        """更新Cookie的自动回复暂停时间"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET pause_duration = ? WHERE id = ?", (pause_duration, cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 自动回复暂停时间: {pause_duration}分钟")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号自动回复暂停时间失败: {e}")
+                return False
+
+    def get_cookie_pause_duration(self, cookie_id: str) -> int:
+        """获取Cookie的自动回复暂停时间"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT pause_duration FROM cookies WHERE id = ?", (cookie_id,))
+                result = cursor.fetchone()
+                if result:
+                    return result[0] or 10  # 默认10分钟
+                return 10  # 如果没有找到记录，返回默认值
+            except Exception as e:
+                logger.error(f"获取账号自动回复暂停时间失败: {e}")
+                return 10  # 出错时返回默认值
 
     def get_auto_confirm(self, cookie_id: str) -> bool:
         """获取Cookie的自动确认发货设置"""
@@ -1183,14 +1283,18 @@ class DBManager:
                             "INSERT INTO keywords (cookie_id, keyword, reply, item_id, type) VALUES (?, ?, ?, ?, 'text')",
                             (cookie_id, keyword, reply, normalized_item_id))
                     except sqlite3.IntegrityError as ie:
-                        # 如果遇到唯一约束冲突，记录详细错误信息
+                        # 如果遇到唯一约束冲突，记录详细错误信息并回滚
                         item_desc = f"商品ID: {normalized_item_id}" if normalized_item_id else "通用关键词"
                         logger.error(f"关键词唯一约束冲突: Cookie={cookie_id}, 关键词='{keyword}', {item_desc}")
+                        self.conn.rollback()
                         raise ie
 
                 self.conn.commit()
                 logger.info(f"文本关键字保存成功: {cookie_id}, {len(keywords)}条，图片关键词已保留")
                 return True
+            except sqlite3.IntegrityError:
+                # 唯一约束冲突，重新抛出异常让上层处理
+                raise
             except Exception as e:
                 logger.error(f"文本关键字保存失败: {e}")
                 self.conn.rollback()
@@ -1524,17 +1628,17 @@ class DBManager:
                 return {}
 
     # -------------------- 默认回复操作 --------------------
-    def save_default_reply(self, cookie_id: str, enabled: bool, reply_content: str = None):
+    def save_default_reply(self, cookie_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False):
         """保存默认回复设置"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO default_replies (cookie_id, enabled, reply_content, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (cookie_id, enabled, reply_content))
+                INSERT OR REPLACE INTO default_replies (cookie_id, enabled, reply_content, reply_once, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (cookie_id, enabled, reply_content, reply_once))
                 self.conn.commit()
-                logger.debug(f"保存默认回复设置: {cookie_id} -> {'启用' if enabled else '禁用'}")
+                logger.debug(f"保存默认回复设置: {cookie_id} -> {'启用' if enabled else '禁用'}, 只回复一次: {'是' if reply_once else '否'}")
             except Exception as e:
                 logger.error(f"保存默认回复设置失败: {e}")
                 raise
@@ -1545,14 +1649,15 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT enabled, reply_content FROM default_replies WHERE cookie_id = ?
+                SELECT enabled, reply_content, reply_once FROM default_replies WHERE cookie_id = ?
                 ''', (cookie_id,))
                 result = cursor.fetchone()
                 if result:
-                    enabled, reply_content = result
+                    enabled, reply_content, reply_once = result
                     return {
                         'enabled': bool(enabled),
-                        'reply_content': reply_content or ''
+                        'reply_content': reply_content or '',
+                        'reply_once': bool(reply_once) if reply_once is not None else False
                     }
                 return None
             except Exception as e:
@@ -1564,20 +1669,60 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('SELECT cookie_id, enabled, reply_content FROM default_replies')
+                cursor.execute('SELECT cookie_id, enabled, reply_content, reply_once FROM default_replies')
 
                 result = {}
                 for row in cursor.fetchall():
-                    cookie_id, enabled, reply_content = row
+                    cookie_id, enabled, reply_content, reply_once = row
                     result[cookie_id] = {
                         'enabled': bool(enabled),
-                        'reply_content': reply_content or ''
+                        'reply_content': reply_content or '',
+                        'reply_once': bool(reply_once) if reply_once is not None else False
                     }
 
                 return result
             except Exception as e:
                 logger.error(f"获取所有默认回复设置失败: {e}")
                 return {}
+
+    def add_default_reply_record(self, cookie_id: str, chat_id: str):
+        """记录已回复的chat_id"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT OR IGNORE INTO default_reply_records (cookie_id, chat_id)
+                VALUES (?, ?)
+                ''', (cookie_id, chat_id))
+                self.conn.commit()
+                logger.debug(f"记录默认回复: {cookie_id} -> {chat_id}")
+            except Exception as e:
+                logger.error(f"记录默认回复失败: {e}")
+
+    def has_default_reply_record(self, cookie_id: str, chat_id: str) -> bool:
+        """检查是否已经回复过该chat_id"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT 1 FROM default_reply_records WHERE cookie_id = ? AND chat_id = ?
+                ''', (cookie_id, chat_id))
+                result = cursor.fetchone()
+                return result is not None
+            except Exception as e:
+                logger.error(f"检查默认回复记录失败: {e}")
+                return False
+
+    def clear_default_reply_records(self, cookie_id: str):
+        """清空指定账号的默认回复记录"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('DELETE FROM default_reply_records WHERE cookie_id = ?', (cookie_id,))
+                self.conn.commit()
+                logger.debug(f"清空默认回复记录: {cookie_id}")
+            except Exception as e:
+                logger.error(f"清空默认回复记录失败: {e}")
 
     def delete_default_reply(self, cookie_id: str) -> bool:
         """删除指定账号的默认回复设置"""
@@ -3890,6 +4035,138 @@ class DBManager:
                 logger.error(f"获取表数据失败: {table_name} - {e}")
                 return [], []
 
+    def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
+                              spec_name: str = None, spec_value: str = None, quantity: str = None,
+                              amount: str = None, order_status: str = None, cookie_id: str = None):
+        """插入或更新订单信息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                # 检查订单是否已存在
+                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # 更新现有订单
+                    update_fields = []
+                    update_values = []
+
+                    if item_id is not None:
+                        update_fields.append("item_id = ?")
+                        update_values.append(item_id)
+                    if buyer_id is not None:
+                        update_fields.append("buyer_id = ?")
+                        update_values.append(buyer_id)
+                    if spec_name is not None:
+                        update_fields.append("spec_name = ?")
+                        update_values.append(spec_name)
+                    if spec_value is not None:
+                        update_fields.append("spec_value = ?")
+                        update_values.append(spec_value)
+                    if quantity is not None:
+                        update_fields.append("quantity = ?")
+                        update_values.append(quantity)
+                    if amount is not None:
+                        update_fields.append("amount = ?")
+                        update_values.append(amount)
+                    if order_status is not None:
+                        update_fields.append("order_status = ?")
+                        update_values.append(order_status)
+                    if cookie_id is not None:
+                        update_fields.append("cookie_id = ?")
+                        update_values.append(cookie_id)
+
+                    if update_fields:
+                        update_fields.append("updated_at = CURRENT_TIMESTAMP")
+                        update_values.append(order_id)
+
+                        sql = f"UPDATE orders SET {', '.join(update_fields)} WHERE order_id = ?"
+                        cursor.execute(sql, update_values)
+                        logger.info(f"更新订单信息: {order_id}")
+                else:
+                    # 插入新订单
+                    cursor.execute('''
+                    INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
+                                      quantity, amount, order_status, cookie_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (order_id, item_id, buyer_id, spec_name, spec_value,
+                          quantity, amount, order_status or 'unknown', cookie_id))
+                    logger.info(f"插入新订单: {order_id}")
+
+                self.conn.commit()
+                return True
+
+            except Exception as e:
+                logger.error(f"插入或更新订单失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
+    def get_order_by_id(self, order_id: str):
+        """根据订单ID获取订单信息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
+                       quantity, amount, order_status, cookie_id, created_at, updated_at
+                FROM orders WHERE order_id = ?
+                ''', (order_id,))
+
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'spec_name': row[3],
+                        'spec_value': row[4],
+                        'quantity': row[5],
+                        'amount': row[6],
+                        'order_status': row[7],
+                        'cookie_id': row[8],
+                        'created_at': row[9],
+                        'updated_at': row[10]
+                    }
+                return None
+
+            except Exception as e:
+                logger.error(f"获取订单信息失败: {order_id} - {e}")
+                return None
+
+    def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
+        """根据Cookie ID获取订单列表"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
+                       quantity, amount, order_status, created_at, updated_at
+                FROM orders WHERE cookie_id = ?
+                ORDER BY created_at DESC LIMIT ?
+                ''', (cookie_id, limit))
+
+                orders = []
+                for row in cursor.fetchall():
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'spec_name': row[3],
+                        'spec_value': row[4],
+                        'quantity': row[5],
+                        'amount': row[6],
+                        'order_status': row[7],
+                        'created_at': row[8],
+                        'updated_at': row[9]
+                    })
+
+                return orders
+
+            except Exception as e:
+                logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
+                return []
+
     def delete_table_record(self, table_name: str, record_id: str):
         """删除指定表的指定记录"""
         with self.lock:
@@ -3909,7 +4186,8 @@ class DBManager:
                     'notification_channels': 'id',
                     'user_settings': 'id',
                     'email_verifications': 'id',
-                    'captcha_codes': 'id'
+                    'captcha_codes': 'id',
+                    'orders': 'order_id'
                 }
 
                 primary_key = primary_key_map.get(table_name, 'id')

@@ -85,6 +85,8 @@ class LoginResponse(BaseModel):
     token: Optional[str] = None
     message: str
     user_id: Optional[int] = None
+    username: Optional[str] = None
+    is_admin: Optional[bool] = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -397,6 +399,33 @@ async def login_page():
 # 注册页面路由
 @app.get('/register.html', response_class=HTMLResponse)
 async def register_page():
+    # 检查注册是否开启
+    from db_manager import db_manager
+    registration_enabled = db_manager.get_system_setting('registration_enabled')
+    if registration_enabled != 'true':
+        return HTMLResponse('''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>注册已关闭</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .message { color: #666; font-size: 18px; }
+                .back-link { margin-top: 20px; }
+                .back-link a { color: #007bff; text-decoration: none; }
+            </style>
+        </head>
+        <body>
+            <h2>🚫 注册功能已关闭</h2>
+            <p class="message">系统管理员已关闭用户注册功能</p>
+            <div class="back-link">
+                <a href="/">← 返回首页</a>
+            </div>
+        </body>
+        </html>
+        ''', status_code=403)
+
     register_path = os.path.join(static_dir, 'register.html')
     if os.path.exists(register_path):
         with open(register_path, 'r', encoding='utf-8') as f:
@@ -448,6 +477,9 @@ async def data_management_page():
         return HTMLResponse('<h3>Data management page not found</h3>')
 
 
+
+
+
 # 商品搜索页面路由
 @app.get('/item_search.html', response_class=HTMLResponse)
 async def item_search_page():
@@ -491,7 +523,9 @@ async def login(request: LoginRequest):
                     success=True,
                     token=token,
                     message="登录成功",
-                    user_id=user['id']
+                    user_id=user['id'],
+                    username=user['username'],
+                    is_admin=(user['username'] == ADMIN_USERNAME)
                 )
 
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
@@ -520,7 +554,9 @@ async def login(request: LoginRequest):
                 success=True,
                 token=token,
                 message="登录成功",
-                user_id=user['id']
+                user_id=user['id'],
+                username=user['username'],
+                is_admin=(user['username'] == ADMIN_USERNAME)
             )
 
         logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
@@ -564,7 +600,9 @@ async def login(request: LoginRequest):
             success=True,
             token=token,
             message="登录成功",
-            user_id=user['id']
+            user_id=user['id'],
+            username=user['username'],
+            is_admin=(user['username'] == ADMIN_USERNAME)
         )
 
     else:
@@ -581,7 +619,8 @@ async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
         return {
             "authenticated": True,
             "user_id": user_info['user_id'],
-            "username": user_info['username']
+            "username": user_info['username'],
+            "is_admin": user_info['username'] == ADMIN_USERNAME
         }
     return {"authenticated": False}
 
@@ -759,6 +798,15 @@ async def send_verification_code(request: SendCodeRequest):
 async def register(request: RegisterRequest):
     from db_manager import db_manager
 
+    # 检查注册是否开启
+    registration_enabled = db_manager.get_system_setting('registration_enabled')
+    if registration_enabled != 'true':
+        logger.warning(f"【{request.username}】注册失败: 注册功能已关闭")
+        return RegisterResponse(
+            success=False,
+            message="注册功能已关闭，请联系管理员"
+        )
+
     try:
         logger.info(f"【{request.username}】尝试注册，邮箱: {request.email}")
 
@@ -813,13 +861,22 @@ async def register(request: RegisterRequest):
 @app.post("/xianyu/reply", response_model=ResponseModel)
 async def xianyu_reply(req: RequestModel):
     msg_template = match_reply(req.cookie_id, req.send_message)
+    is_default_reply = False
+
     if not msg_template:
         # 从数据库获取默认回复
         from db_manager import db_manager
         default_reply_settings = db_manager.get_default_reply(req.cookie_id)
 
         if default_reply_settings and default_reply_settings.get('enabled', False):
+            # 检查是否开启了"只回复一次"功能
+            if default_reply_settings.get('reply_once', False):
+                # 检查是否已经回复过这个chat_id
+                if db_manager.has_default_reply_record(req.cookie_id, req.chat_id):
+                    raise HTTPException(status_code=404, detail="该对话已使用默认回复，不再重复回复")
+
             msg_template = default_reply_settings.get('reply_content', '')
+            is_default_reply = True
 
         # 如果数据库中没有设置或为空，返回错误
         if not msg_template:
@@ -835,6 +892,13 @@ async def xianyu_reply(req: RequestModel):
     except Exception:
         # 如果格式化失败，返回原始内容
         send_msg = msg_template
+
+    # 如果是默认回复且开启了"只回复一次"，记录回复记录
+    if is_default_reply:
+        from db_manager import db_manager
+        default_reply_settings = db_manager.get_default_reply(req.cookie_id)
+        if default_reply_settings and default_reply_settings.get('reply_once', False):
+            db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
 
     return {"code": 200, "data": {"send_msg": send_msg}}
 
@@ -853,6 +917,7 @@ class CookieStatusIn(BaseModel):
 class DefaultReplyIn(BaseModel):
     enabled: bool
     reply_content: Optional[str] = None
+    reply_once: bool = False
 
 
 class NotificationChannelIn(BaseModel):
@@ -908,11 +973,17 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     for cookie_id, cookie_value in user_cookies.items():
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
+        # 获取备注信息
+        cookie_details = db_manager.get_cookie_details(cookie_id)
+        remark = cookie_details.get('remark', '') if cookie_details else ''
+
         result.append({
             'id': cookie_id,
             'value': cookie_value,
             'enabled': cookie_enabled,
-            'auto_confirm': auto_confirm
+            'auto_confirm': auto_confirm,
+            'remark': remark,
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
         })
     return result
 
@@ -1128,7 +1199,7 @@ def get_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_curre
         result = db_manager.get_default_reply(cid)
         if result is None:
             # 如果没有设置，返回默认值
-            return {'enabled': False, 'reply_content': ''}
+            return {'enabled': False, 'reply_content': '', 'reply_once': False}
         return result
     except HTTPException:
         raise
@@ -1148,8 +1219,8 @@ def update_default_reply(cid: str, reply_data: DefaultReplyIn, current_user: Dic
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
-        db_manager.save_default_reply(cid, reply_data.enabled, reply_data.reply_content)
-        return {'msg': 'default reply updated', 'enabled': reply_data.enabled}
+        db_manager.save_default_reply(cid, reply_data.enabled, reply_data.reply_content, reply_data.reply_once)
+        return {'msg': 'default reply updated', 'enabled': reply_data.enabled, 'reply_once': reply_data.reply_once}
     except HTTPException:
         raise
     except Exception as e:
@@ -1190,6 +1261,26 @@ def delete_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_cu
             return {'msg': 'default reply deleted'}
         else:
             raise HTTPException(status_code=400, detail='删除失败')
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/default-replies/{cid}/clear-records')
+def clear_default_reply_records(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """清空指定账号的默认回复记录"""
+    from db_manager import db_manager
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        db_manager.clear_default_reply_records(cid)
+        return {'msg': 'default reply records cleared'}
     except HTTPException:
         raise
     except Exception as e:
@@ -1415,6 +1506,66 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Dep
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ------------------------- 注册设置接口 -------------------------
+
+@app.get('/registration-status')
+def get_registration_status():
+    """获取注册开关状态（公开接口，无需认证）"""
+    from db_manager import db_manager
+    try:
+        enabled_str = db_manager.get_system_setting('registration_enabled')
+        logger.info(f"从数据库获取的注册设置值: '{enabled_str}'")  # 调试信息
+
+        # 如果设置不存在，默认为开启
+        if enabled_str is None:
+            enabled_bool = True
+            message = '注册功能已开启'
+        else:
+            enabled_bool = enabled_str == 'true'
+            message = '注册功能已开启' if enabled_bool else '注册功能已关闭'
+
+        logger.info(f"解析后的注册状态: enabled={enabled_bool}, message='{message}'")  # 调试信息
+
+        return {
+            'enabled': enabled_bool,
+            'message': message
+        }
+    except Exception as e:
+        logger.error(f"获取注册状态失败: {e}")
+        return {'enabled': True, 'message': '注册功能已开启'}  # 出错时默认开启
+
+
+class RegistrationSettingUpdate(BaseModel):
+    enabled: bool
+
+
+@app.put('/registration-settings')
+def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """更新注册开关设置（仅管理员）"""
+    from db_manager import db_manager
+    try:
+        enabled = setting_data.enabled
+        success = db_manager.set_system_setting(
+            'registration_enabled',
+            'true' if enabled else 'false',
+            '是否开启用户注册'
+        )
+        if success:
+            log_with_user('info', f"更新注册设置: {'开启' if enabled else '关闭'}", admin_user)
+            return {
+                'success': True,
+                'enabled': enabled,
+                'message': f"注册功能已{'开启' if enabled else '关闭'}"
+            }
+        else:
+            raise HTTPException(status_code=500, detail='更新注册设置失败')
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新注册设置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 
@@ -1441,6 +1592,14 @@ def remove_cookie(cid: str, current_user: Dict[str, Any] = Depends(get_current_u
 
 class AutoConfirmUpdate(BaseModel):
     auto_confirm: bool
+
+
+class RemarkUpdate(BaseModel):
+    remark: str
+
+
+class PauseDurationUpdate(BaseModel):
+    pause_duration: int
 
 
 @app.put("/cookies/{cid}/auto-confirm")
@@ -1502,6 +1661,124 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.put("/cookies/{cid}/remark")
+def update_cookie_remark(cid: str, update_data: RemarkUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号备注"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 更新备注
+        success = db_manager.update_cookie_remark(cid, update_data.remark)
+        if success:
+            log_with_user('info', f"更新账号备注: {cid} -> {update_data.remark}", current_user)
+            return {
+                "message": "备注更新成功",
+                "remark": update_data.remark
+            }
+        else:
+            raise HTTPException(status_code=500, detail="备注更新失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/remark")
+def get_cookie_remark(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号备注"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 获取Cookie详细信息（包含备注）
+        cookie_details = db_manager.get_cookie_details(cid)
+        if cookie_details:
+            return {
+                "remark": cookie_details.get('remark', ''),
+                "message": "获取备注成功"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="账号不存在")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/cookies/{cid}/pause-duration")
+def update_cookie_pause_duration(cid: str, update_data: PauseDurationUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号自动回复暂停时间"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 验证暂停时间范围（1-60分钟）
+        if not (1 <= update_data.pause_duration <= 60):
+            raise HTTPException(status_code=400, detail="暂停时间必须在1-60分钟之间")
+
+        # 更新暂停时间
+        success = db_manager.update_cookie_pause_duration(cid, update_data.pause_duration)
+        if success:
+            log_with_user('info', f"更新账号自动回复暂停时间: {cid} -> {update_data.pause_duration}分钟", current_user)
+            return {
+                "message": "暂停时间更新成功",
+                "pause_duration": update_data.pause_duration
+            }
+        else:
+            raise HTTPException(status_code=500, detail="暂停时间更新失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/pause-duration")
+def get_cookie_pause_duration(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号自动回复暂停时间"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 获取暂停时间
+        pause_duration = db_manager.get_cookie_pause_duration(cid)
+        return {
+            "pause_duration": pause_duration,
+            "message": "获取暂停时间成功"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -1619,8 +1896,8 @@ def update_keywords_with_item_id(cid: str, body: KeywordWithItemIdIn, current_us
         reply = kw_data.get('reply', '').strip()
         item_id = kw_data.get('item_id', '').strip() or None
 
-        if not keyword or not reply:
-            raise HTTPException(status_code=400, detail="关键词和回复内容不能为空")
+        if not keyword:
+            raise HTTPException(status_code=400, detail="关键词不能为空")
 
         # 检查当前提交的关键词中是否有重复
         keyword_key = f"{keyword}|{item_id or ''}"
@@ -1631,10 +1908,22 @@ def update_keywords_with_item_id(cid: str, body: KeywordWithItemIdIn, current_us
 
         keywords_to_save.append((keyword, reply, item_id))
 
-    # 保存关键词
-    success = db_manager.save_keywords_with_item_id(cid, keywords_to_save)
-    if not success:
-        raise HTTPException(status_code=500, detail="保存关键词失败")
+    # 保存关键词（只保存文本关键词，保留图片关键词）
+    try:
+        success = db_manager.save_text_keywords_only(cid, keywords_to_save)
+        if not success:
+            raise HTTPException(status_code=500, detail="保存关键词失败")
+    except Exception as e:
+        error_msg = str(e)
+        if "UNIQUE constraint failed" in error_msg:
+            # 解析具体的冲突信息
+            if "keywords.cookie_id, keywords.keyword" in error_msg:
+                raise HTTPException(status_code=400, detail="关键词重复！该关键词已存在（可能是图片关键词或文本关键词），请使用其他关键词")
+            else:
+                raise HTTPException(status_code=400, detail="关键词重复！请使用不同的关键词或商品ID组合")
+        else:
+            log_with_user('error', f"保存关键词时发生未知错误: {error_msg}", current_user)
+            raise HTTPException(status_code=500, detail="保存关键词失败")
 
     log_with_user('info', f"更新Cookie关键字(含商品ID): {cid}, 数量: {len(keywords_to_save)}", current_user)
     return {"msg": "updated", "count": len(keywords_to_save)}
@@ -1819,8 +2108,8 @@ async def import_keywords(cid: str, file: UploadFile = File(...), current_user: 
             item_id = str(row['商品ID']).strip() if pd.notna(row['商品ID']) and str(row['商品ID']).strip() else None
             reply = str(row['关键词内容']).strip()
 
-            if not keyword or not reply:
-                continue  # 跳过空行
+            if not keyword:
+                continue  # 跳过没有关键词的行
 
             # 检查是否重复
             key = f"{keyword}|{item_id or ''}"
@@ -3372,9 +3661,10 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
 
         # 验证表名安全性
         allowed_tables = [
-            'users', 'cookies', 'keywords', 'default_replies', 'ai_reply_settings',
+            'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
+            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
-            'user_settings', 'email_verifications', 'captcha_codes'
+            'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders'
         ]
 
         if table_name not in allowed_tables:
@@ -3408,9 +3698,10 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
 
         # 验证表名安全性
         allowed_tables = [
-            'users', 'cookies', 'keywords', 'default_replies', 'ai_reply_settings',
+            'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
+            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
-            'user_settings', 'email_verifications', 'captcha_codes'
+            'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders'
         ]
 
         if table_name not in allowed_tables:
@@ -3447,9 +3738,10 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
 
         # 验证表名安全性
         allowed_tables = [
-            'cookies', 'keywords', 'default_replies', 'ai_reply_settings',
+            'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
+            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
-            'user_settings', 'email_verifications', 'captcha_codes'
+            'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders'
         ]
 
         # 不允许清空用户表
